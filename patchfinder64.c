@@ -235,7 +235,7 @@ bof64(const uint8_t *buf, addr_t start, addr_t where)
             if ((delta & 0xF) == 0) {
                 addr_t prev = where - ((delta >> 4) + 1) * 4;
                 uint32_t au = *(uint32_t *)(buf + prev);
-                if ((au & 0xFFC003E0) == 0xA98003E0) {
+                if ((au & 0x3BC003E0) == 0x298003E0) {
                     //printf("%x: STP x, y, [SP,#-imm]!\n", prev);
                     return prev;
                 }

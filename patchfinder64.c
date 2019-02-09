@@ -313,6 +313,16 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
             unsigned adr = (op & 0xFFFFE0) >> 3;
             //printf("%llx: LDR X%d, =0x%llx\n", i, reg, adr + i);
             value[reg] = adr + i;		// XXX address, not actual value
+        } else if ((op & 0xFC000000) == 0x94000000) {
+            // BL addr
+            signed imm = (op & 0x3FFFFFF) << 2;
+            if (op & 0x2000000) {
+                imm |= 0xf << 28;
+            }
+            unsigned adr = (unsigned)(i + imm);
+            if (adr == what) {
+                return i;
+            }
         }
         if (value[reg] == what) {
             return i;

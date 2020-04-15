@@ -3579,7 +3579,7 @@ int patch_snapshot_string(void) {
     return 0;
 }
 
-// makes every binary appear to be in the dynamic trust cache
+// makes every binary appear to be trustcached
 int patch_amfi(void) {
     if (save_fd < 0) return 1;
     

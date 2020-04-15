@@ -11,12 +11,14 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/syscall.h>
+#include <copyfile.h>
 #include "mac_policy.h"
 #include "patchfinder64.h"
 
 bool auth_ptrs = false;
 typedef unsigned long long addr_t;
 static addr_t kerndumpbase = -1;
+static addr_t kerndumpbase_fileoff = -1;
 static addr_t xnucore_base = 0;
 static addr_t xnucore_size = 0;
 static addr_t ppl_base = 0;
@@ -56,6 +58,9 @@ bool monolithic_kernel = false;
 #define INSN_B    0x14000000, 0xFC000000
 #define INSN_CBZ  0x34000000, 0x7F000000
 #define INSN_ADRP 0x90000000, 0x9F000000
+#define INSN_TBNZ 0x37000000, 0xFF000000
+#define INSN_TBZ  0x36000000, 0xFF000000
+#define INSN_LDR  0xB9400000, 0xB9C00000
 
 static unsigned char *
 boyermoore_horspool_memmem(const unsigned char* haystack, size_t hlen,
@@ -629,6 +634,7 @@ init_kernel(size_t (*kread)(uint64_t, void *, size_t), addr_t kernel_base, const
             const struct segment_command_64 *seg = (struct segment_command_64 *)q;
             if (min > seg->vmaddr && seg->vmsize > 0) {
                 min = seg->vmaddr;
+                kerndumpbase_fileoff = seg->fileoff;
             }
             if (max < seg->vmaddr + seg->vmsize && seg->vmsize > 0) {
                 max = seg->vmaddr + seg->vmsize;
@@ -1397,7 +1403,7 @@ find_realhost(addr_t priv)
  *
  * @ninjaprawn's patches
  *
- */ 
+ */
 
 addr_t find_vfs_context_current(void) {
     addr_t str = find_strref("/private/var/tmp/wav%u_%uchans.wav", 1, string_base_pstring, false, false);
@@ -1835,7 +1841,7 @@ addr_t find_add_x0_x0_0x40_ret(void)
 
 /*
  *
- * 
+ *
  *
  */
 
@@ -1843,7 +1849,7 @@ addr_t find_add_x0_x0_0x40_ret(void)
  *
  * @Cryptiiiic's patches
  *
- */ 
+ */
 
 addr_t find_boottime(void) {
     addr_t ref = find_strref("%s WARNING: PMU offset is less then sys PMU", 1, string_base_oslstring, false, false);
@@ -1892,7 +1898,7 @@ addr_t find_boottime(void) {
 
 /*
  *
- * 
+ *
  *
  */
 
@@ -3233,6 +3239,248 @@ addr_t find_flow_divert_connect_out() {
     
     return start + kerndumpbase;
 }
+
+addr_t find_PE_i_can_has_debugger(void) {
+    addr_t symbol = find_symbol("_PE_i_can_has_debugger");
+    if (symbol) {
+        return symbol;
+    }
+    
+    addr_t str = find_strref("%s: cs_enforcement disabled by boot-arg\n", 1, string_base_cstring, false, false);
+    bool pstring = false;
+    if (!str) {
+        str = find_strref("%s: cs_enforcement disabled by boot-arg\n", 1, string_base_pstring, false, false);
+        pstring = true;
+        if (!str) {
+            return 0;
+        }
+    }
+    str -= kerndumpbase;
+    
+    addr_t call = step64(kernel, str, 16, INSN_CALL);
+    if (!call) {
+        return 0;
+    }
+    call = step64(kernel, call + 4, 16, INSN_CALL);
+    if (!call) {
+        return 0;
+    }
+    
+    addr_t func = follow_call64(kernel, call);
+    if (!func) {
+        return 0;
+    }
+    if (pstring) {
+        // the func is just a stub
+        addr_t actual_ptr = calc64(kernel, func, func + 8, 16);
+        if (!actual_ptr) {
+            return 0;
+        }
+        addr_t actual = *(addr_t *)(kernel + actual_ptr);
+        if (!actual) {
+            return 0;
+        }
+        return actual;
+    }
+    return func + kerndumpbase;
+}
+
+addr_t find_snapshot_string(void) {
+    addr_t str = find_str("com.apple.os.update-");
+    if (!str) {
+        return 0;
+    }
+    
+    return str;
+}
+
+
+addr_t find_amfi_patch() {
+    addr_t str = find_strref("in-kernel", 1, string_base_pstring, false, false);
+    if (!str) {
+        return 0;
+    }
+    str -= kerndumpbase;
+    
+    addr_t call = step64_back(kernel, str, 100, INSN_CALL);
+    if (!call) {
+        return 0;
+    }
+    
+    call = follow_call64(kernel, call);
+    if (!call) {
+        return 0;
+    }
+    
+    return call + kerndumpbase;
+}
+
+addr_t find_csblob_get_hashtype(void) {
+    addr_t sym = find_symbol("_csblob_get_hashtype");
+    if (sym) {
+        return sym;
+    }
+    
+    addr_t str = find_strref("%s: Hash type is not SHA256 (%u) but %u.", 1, string_base_pstring, false, false);
+    if (!str) {
+        return 0;
+    }
+    str -= kerndumpbase;
+    
+    uint64_t call = step64_back(kernel, str, 100, INSN_CALL);
+    if (!call) {
+        return 0;
+    }
+    
+    call = follow_call64(kernel, call);
+    if (!call) {
+        return 0;
+    }
+    
+    return call + kerndumpbase;
+}
+
+addr_t find_invalid_pages_patch(void) {
+    uint32_t search[] = {
+        0x32170108, // orr w8, w8, #0x200
+    };
+    
+    // is this hacky? tested on 12.4 Air 2, 13.1 Air 2 and 12.0 beta symbolicated kernel
+    uint64_t addr = xnucore_base - 4;
+    uint64_t found = 0;
+    while (addr <= addr + xnucore_size) {
+        addr = (uint64_t)boyermoore_horspool_memmem((unsigned char *)((uint64_t)kernel + addr + 4), xnucore_base + xnucore_size - addr - 4, (const unsigned char *)search, sizeof(search));
+        if (!addr) {
+            break;
+        }
+        addr -= (uint64_t)kernel;
+        uint32_t op = *(uint32_t*)(kernel + addr + 4);
+        if ((op & 0xb9c00000) == 0xb9000000) {            // str w?, [x?, #0x?]
+            int reg = op & 0x1f;
+            if (reg == 8) {                               // str w8, [x?, #0x?]
+                int reg2 = (op >> 5) & 0x1f;
+                if (reg2 > 20) {                          // str w8, [xn, #0x?], n > 20
+                    unsigned imm = ((op >> 10) & 0xfff) << 2;
+                    if (imm == 0x290 || imm == 0x298) {   // str w8, [xn, #0x290 or #0x298], n > 20
+                        found = addr;
+                        break;
+                    }
+                }
+            }
+        }
+        addr += 4;
+    }
+    
+    if (!found) {
+        return 0;
+    }
+    
+    addr_t tbnz = step64(kernel, found, 100, INSN_TBNZ);
+    if (!tbnz) {
+        return 0;
+    }
+    
+    return tbnz + kerndumpbase;
+}
+
+addr_t find_invalid_pages_patch_2(void) {
+    addr_t tbnz = find_invalid_pages_patch();
+    if (!tbnz) {
+        return 0;
+    }
+    tbnz -= kerndumpbase;
+    
+    addr_t tbz = step64(kernel, tbnz, 100, INSN_TBZ);
+    if (!tbz) {
+        return 0;
+    }
+    
+    return tbz + kerndumpbase;
+}
+
+addr_t find_mount_patch(void) {
+    uint32_t search[] = {
+        0xf9406ec8, // ldr x8, [x22, #0xd8]
+        0x3941c508  // ldrb w8, [x8, #0x71]
+    };
+    
+    uint64_t addr = (uint64_t)boyermoore_horspool_memmem((unsigned char *)((uint64_t)kernel + xnucore_base), xnucore_size, (const unsigned char *)search, sizeof(search));
+    if (!addr) {
+        search[0] = 0xf9406ee8; // ldr x8, [x23, #0xd8]
+        addr = (uint64_t)boyermoore_horspool_memmem((unsigned char *)((uint64_t)kernel + xnucore_base), xnucore_size, (const unsigned char *)search, sizeof(search));
+        if (!addr) {
+            return 0;
+        }
+    }
+    addr -= (addr_t)kernel;
+    
+    addr_t tbnz = step64(kernel, addr, 100, INSN_TBNZ);
+    if (!tbnz) {
+        return 0;
+    }
+    return tbnz + kerndumpbase;
+}
+
+addr_t find_process_exec_patch(void) {
+    addr_t string = find_strref("process-exec denied while updating label", 1, string_base_pstring, true, false);
+    if (!string) {
+        return 0;
+    }
+    
+    string -= kerndumpbase;
+    
+    addr_t cbz = step64_back(kernel, string, 12, INSN_CBZ);
+    if (!cbz) {
+        return 0;
+    }
+    
+    return cbz - 4 + kerndumpbase;
+}
+
+addr_t find_process_exec_patch_2(void) {
+    addr_t string = find_strref("forbidden-exec-sugid", 1, string_base_pstring, true, false);
+    if (!string) {
+        return 0;
+    }
+    string -= kerndumpbase;
+    
+    addr_t start = bof64(kernel, prelink_base, string);
+    if (!start) {
+        return 0;
+    }
+    start += kerndumpbase;
+    
+    addr_t sbops = find_sbops();
+    if (!sbops) {
+        return 0;
+    }
+    sbops -= kerndumpbase;
+    
+    for (int i = 0; i < 400; i++) {
+        addr_t sbop = *(uint64_t*)(kernel + sbops + i*8);
+        if (sbop) {
+            sbop |= 0xfffffff000000000;
+            if (sbop == start) {
+                return kerndumpbase + sbops + i*8;
+            }
+        }
+    }
+    return 0;
+}
+
+// utilities for generating instructions
+uint32_t make_b_call(uint64_t to, uint64_t from) {
+    int64_t offset = to - from; // the offset between current instruction and target address
+    uint32_t patch = 0x14000000 | ((offset / 4) & 0x03ffffff);
+    return patch;
+}
+
+uint32_t make_bl_call(uint64_t to, uint64_t from) {
+    int64_t offset = to - from; // the offset between current instruction and target address
+    uint32_t patch = 0x94000000 | ((offset / 4) & 0x03ffffff);
+    return patch;
+}
+
 /*
  *
  *
@@ -3295,20 +3543,368 @@ find_symbol(const char *symbol)
     return 0;
 }
 
+int save_fd = -1;
+
+// makes PE_i_can_has_debugger return 1
+int patch_PE_i_can_has_debugger(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_PE_i_can_has_debugger();
+    if (!addr) return 1;
+    
+    addr -= kerndumpbase;
+    
+    *(uint32_t *)(kernel + addr) = 0xd2800020; // mov x0, #1
+    *(uint32_t *)(kernel + addr + 4) = 0xd65f03c0; // ret
+    
+    lseek(save_fd, addr + kerndumpbase_fileoff, SEEK_SET);
+    write(save_fd, kernel + addr, 8);
+    
+    return 0;
+}
+
+// prevents kernel from booting the rootfs snapshot
+int patch_snapshot_string(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_snapshot_string();
+    if (!addr) return 1;
+    
+    addr -= kerndumpbase;
+    
+    memcpy(kernel + addr, "tim.apple.is.checkm8", strlen("tim.apple.is.checkm8"));
+    lseek(save_fd, addr + kerndumpbase_fileoff, SEEK_SET);
+    write(save_fd, kernel + addr, 8);
+    
+    return 0;
+}
+
+// makes every binary appear to be in the dynamic trust cache
+int patch_amfi(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_amfi_patch();
+    if (!addr) return 1;
+
+    addr -= kerndumpbase;
+    
+    *(uint32_t *)(kernel + addr) = 0xd2800020; // mov x0, #1
+    *(uint32_t *)(kernel + addr + 4) = 0xd65f03c0; // ret
+    
+    lseek(save_fd, addr + kerndumpbase_fileoff, SEEK_SET);
+    write(save_fd, kernel + addr, 8);
+    
+    return 0;
+}
+
+// makes every binary appear to have a SHA256 hash (required for anything that is on a trust cache since iOS 11)
+int patch_csblob_get_hashtype(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_csblob_get_hashtype();
+    if (!addr) return 1;
+    
+    addr -= kerndumpbase;
+    
+    *(uint32_t *)(kernel + addr) = 0x52800040;     // mov w0, #2
+    *(uint32_t *)(kernel + addr + 4) = 0xd65f03c0; // ret
+    
+    lseek(save_fd, addr - (0xfffffff007004000 - kerndumpbase), SEEK_SET);
+    write(save_fd, kernel + addr, 12);
+    
+    return 0;
+}
+
+// allows a process to have unsigned pages. this is done by removing CS_KILL and CS_HARD checks
+// it's probably better to avoid adding CS_KILL and CS_HARD at the first place??
+int patch_invalid_pages(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_invalid_pages_patch();
+    if (!addr) return 1;
+    
+    addr_t addr2 = find_invalid_pages_patch_2();
+    if (!addr2) return 1;
+    
+    addr -= kerndumpbase;
+    addr2 -= kerndumpbase;
+    
+    *(uint32_t *)(kernel + addr) = 0xd503201f; // nop
+
+    uint64_t op = (uint64_t)(*(uint32_t*)(kernel + addr2));
+    uint64_t target = ((op << 45) >> 50) * 4 + addr2 + kerndumpbase;
+
+    uint32_t patch = make_b_call(target, addr2 + kerndumpbase);
+    *(uint32_t *)(kernel + addr2) = patch; // b target
+    
+    lseek(save_fd, addr - (0xfffffff007004000 - kerndumpbase), SEEK_SET);
+    write(save_fd, kernel + addr, 4);
+    lseek(save_fd, addr2 - (0xfffffff007004000 - kerndumpbase), SEEK_SET);
+    write(save_fd, kernel + addr2, 4);
+    
+    return 0;
+}
+
+// makes task_for_pid work
+/*int patch_task_for_pid(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_task_for_pid();
+    if (!addr) return 1;
+    
+    addr -= kerndumpbase;
+    
+    while (1) {
+        uint32_t opcode = *(uint32_t *)(kernel + addr);
+        if ((opcode & 0xfc000000) == 0x34000000) {
+            break;
+        }
+        addr += 4;
+    }
+    
+    // make task_for_pid accept pid 0
+    *(uint32_t *)(kernel + addr) = 0xd503201f; // nop
+
+    lseek(save_fd, addr - (0xfffffff007004000 - kerndumpbase), SEEK_SET);
+    write(save_fd, kernel + addr, 4);
+    
+    // we're not done, any use of the kernel task that is not by the kernel will result in an error, this is checked in task_conversion_eval(), function is inlined unfortunately, so we can only start to guess based on a pattern
+    
+    /*
+        Pattern:
+         cmp Xm, Xn                      ; Xm = kernel_task, Xn = victim;
+         b.eq error                      ; if (victim == kernel_task) goto error;
+         ldr Xm, [Xn, #offsetof_t_flags] ; immediately after task check there should be the TF_PLATFORM check
+     * /
+    
+    // doesn't seem to be working yet
+    for (int i = 0; i < xnucore_size/4 - 3; i++) {
+        uint32_t op = *(uint32_t*)(kernel + xnucore_base + i * 4);
+        if ((op & 0xff20001f) == 0xeb00001f) { // cmp Xm, Xn
+            int m = (op & 0x3e0) >> 5;
+            int n = (op & 0x1f0000) >> 16;
+            //printf("\tfound at: 0x%llx\n\t\t cmp x%d, x%d\n", kerndumpbase + xnucore_base + i * 4, m, n);
+            
+            uint32_t next_op = *(uint32_t*)(kernel + xnucore_base + i * 4 + 4);
+            if ((next_op & 0xff00001f) == 0x54000000) { // b.eq addr
+                //printf("\tfound b.eq at: 0x%llx\n", kerndumpbase + xnucore_base + i * 4 + 4);
+                
+                uint32_t should_be = 0xb9400000 | m | (n << 5) | (0x390 << 8);
+                uint32_t third_op = *(uint32_t*)(kernel + xnucore_base + i * 4 + 8);
+                if (third_op == should_be) {
+                    printf("\tfound it at 0x%llx\n", kerndumpbase + xnucore_base + i * 4 + 8);
+                    
+                    *(uint32_t*)(kernel + xnucore_base + i * 4 + 4) |= 1; // make the b.eq a b.ne
+                    uint32_t new_op = op;
+                    new_op &= ~0x1f0000;
+                    new_op |= m << 16;
+                    *(uint32_t*)(kernel + xnucore_base + i * 4) = new_op; // make cmp Xm, Xn a cmp Xm, Xm
+                    
+                    lseek(save_fd, xnucore_base + i * 4 - (0xfffffff007004000 - kerndumpbase), SEEK_SET);
+                    write(save_fd, kernel + xnucore_base + i * 4, 8);
+                }
+            }
+        }
+    }
+    
+    return 0;
+}*/
+
+// sandbox profile patches only work on iOS 12
+// some patchfinders are missing
+
+// patches the platform profile to allow interpreters (the execution of scripts)
+/*int patch_platform_profile(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_the_real_platform_profile_data();
+    if (!addr) return 1;
+    
+    addr -= kerndumpbase;
+    
+    int process_exec_interpreter = (int)offsetof_sbop("process-exec-interpreter");
+    if (!process_exec_interpreter) {
+        return 1;
+    }
+    
+    int idx = 0;
+    uint32_t val = 0;
+    uint16_t patch = 0;
+    do {
+        patch = *(uint16_t*)(kernel + addr + idx * 2);
+        val = *(uint32_t*)(kernel + addr + patch * 8);
+        idx++;
+    } while (val != 1);
+    
+    *(uint16_t*)(kernel + addr + 12 + process_exec_interpreter * 2) = patch;
+    lseek(save_fd, addr + kerndumpbase_fileoff + 12 + process_exec_interpreter * 2, SEEK_SET);
+    write(save_fd, kernel + addr + 12 + process_exec_interpreter * 2, 2);
+    
+    return 0;
+}
+
+// patches sandbox profiles to allow some operations
+int patch_sandbox_profiles(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_the_real_collection_data();
+    if (!addr) return 1;
+    
+    addr -= kerndumpbase;
+    
+    // allow us to load dylibs in /var
+    int fme_idx = (int)offsetof_sbop("file-map-executable");
+    if (!fme_idx) return 1;
+    
+    // give everything read access to anything. is this too much freedom?
+    int fread_idx = (int)offsetof_sbop("file-read*");
+    if (!fread_idx) return 1;
+    int freaddata_idx = (int)offsetof_sbop("file-read-data");
+    if (!freaddata_idx) return 1;
+    int freadmeta_idx = (int)offsetof_sbop("file-read-metadata");
+    if (!freadmeta_idx) return 1;
+    
+    // freely allow IPC
+    int mach_lookup_idx = (int)offsetof_sbop("mach-lookup");
+    if (!mach_lookup_idx) return 1;
+    
+    // idk if this does anything but it sounds cool
+    int unsigned_code_idx = (int)offsetof_sbop("load-unsigned-code");
+    if (!unsigned_code_idx) return 1;
+    
+    // JIT
+    int dynamic_code_idx = (int)offsetof_sbop("dynamic-code-generation");
+    if (!dynamic_code_idx) return 1;
+    
+    uint32_t numsbops = size_sbops();
+    if (!numsbops) return 1;
+
+    uint32_t profile_off = 0;
+    char *found = NULL;
+    int idx = 0;
+    do {
+        if (found) {
+            free(found);
+            found = NULL;
+        }
+        uint16_t string_off = *(uint16_t*)(kernel + addr + 14 + (numsbops + 2) * 2 * idx);
+        uint32_t size = *(uint32_t *)(kernel + addr + string_off * 8);
+        found = malloc(size);
+        memcpy(found, kernel + addr + string_off * 8 + 4, size);
+        profile_off = 14 + (numsbops + 2) * 2 * idx;
+        idx++;
+
+        int op_idx = 0;
+        uint32_t val = 0;
+        uint16_t patch = 0;
+        do {
+            patch = *(uint16_t *)(kernel + addr + profile_off + op_idx * 2); // patch appears to be the same on all profiles, but just to be sure...
+            val = *(uint32_t*)(kernel + addr + patch * 8);
+            op_idx++;
+        } while (val != 1);
+        
+#define patch_op(op) \
+        *(uint16_t*)(kernel + addr + profile_off + 4 + op * 2) = patch; \
+        lseek(save_fd, addr + kerndumpbase_fileoff + profile_off + 4 + op * 2, SEEK_SET); \
+        write(save_fd, kernel + addr + profile_off + 4 + op * 2, 2);
+
+        patch_op(fme_idx);
+        patch_op(fread_idx);
+        patch_op(freaddata_idx);
+        patch_op(freadmeta_idx);
+        patch_op(mach_lookup_idx);
+        patch_op(unsigned_code_idx);
+        patch_op(dynamic_code_idx);
+        
+    } while (strcmp(found, "trace"));
+    
+    free(found);
+    found = NULL;
+    
+    return 0;
+}*/
+
+// allow mount() to work on the rootfs
+int patch_mount(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_mount_patch();
+    if (!addr) return 1;
+    
+    addr -= kerndumpbase;
+    
+    *(uint8_t*)(kernel + addr + 3) = 0xb6; // change 'tbnz w24, #0, #something' to 'tbz x24, #32, #something', which should always be true
+    lseek(save_fd, addr + 3, SEEK_SET);
+    write(save_fd, kernel + addr + 3, 1);
+    
+    return 0;
+}
+
+// allow binaries to be executed in /var without the container-required entitlement (set as false)
+// we could do this by always allowing the process-exec* policy in the platform profile, but that will skip some code that is required to set up containers, thus uncontainerizing everything. instead we'll patch the checks of the return value of sb_evaluate() in hook_cred_label_update_execve and disable hook_vnode_check_exec completely
+int patch_process_exec(void) {
+    if (save_fd < 0) return 1;
+    
+    addr_t addr = find_process_exec_patch();
+    if (!addr) return 1;
+    addr -= kerndumpbase;
+    
+    addr_t addr1 = find_process_exec_patch_2();
+    if (!addr1) return 1;
+    addr1 -= kerndumpbase;
+    
+    // first patch, bypasses container-required requirement for process that is to be executed
+    *(uint32_t *)(kernel + addr) = 0xd280001b; // mov x27, #0
+    lseek(save_fd, addr + kerndumpbase_fileoff, SEEK_SET);
+    write(save_fd, kernel + addr, 4);
+
+    // second patch, bypasses container-required requirement for the executor
+    *(uint64_t *)(kernel + addr1) = 0; // make vnode_check_exec be 0
+    lseek(save_fd, addr1 + kerndumpbase_fileoff, SEEK_SET);
+    write(save_fd, kernel + addr1, 8);
+    
+    return 0;
+}
 #ifdef HAVE_MAIN
 
 int
 main(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: patchfinder64 _decompressed_kernel_image_\n");
-        printf("iOS ARM64 kernel patchfinder\n");
+        printf("Usage: patchfinder64 _decompressed_kernel_image_ <optional arguments>\n");
+        printf("\tArguments: \n\t-p _path_where_to_save_: apply jailbreak patches and save\n");
         exit(EXIT_FAILURE);
     }
     if (access(argv[1], F_OK) != 0) {
         printf("%s: %s\n", argv[1], strerror(errno));
         exit(EXIT_FAILURE);
     }
+    
+    if (argc >= 3) {
+        if (!strcmp(argv[2], "-p")) {
+            if (argc != 4) {
+                printf("-p requires path argument\n");
+                exit(EXIT_FAILURE);
+            }
+            else {
+                if (!access(argv[3], F_OK)) {
+                    printf("File %s exists\n", argv[3]);
+                    exit(EXIT_FAILURE);
+                }
+                copyfile(argv[1], argv[3], NULL, COPYFILE_DATA);
+                save_fd = open(argv[3], O_RDWR);
+                if (save_fd < 0) {
+                    printf("%s: %s\n", argv[3], strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }
+        else {
+            printf("Unknown argument %s\n", argv[2]);
+            exit(EXIT_FAILURE);
+        }
+    }
+    
     int rv;
     addr_t kernel_base = 0;
     const addr_t vm_kernel_slide = 0;
@@ -3317,96 +3913,102 @@ main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
+    bool pass = false;
+    
 #define FIND(name) do { \
     addr_t patchfinder_offset = find_ ##name (); \
-    printf("%s: PF=0x%llx - %s\n", #name, patchfinder_offset, (patchfinder_offset != 0 && patchfinder_offset != kerndumpbase)? "PASS" : "FAIL"); \
+    pass = (patchfinder_offset != 0 && patchfinder_offset != kerndumpbase); \
+    printf("%s: PF=0x%llx - %s\n", #name, patchfinder_offset, pass ? "PASS" : "FAIL"); \
 } while(false)
+    
 #define CHECK(name) do { \
     addr_t actual_offset = find_symbol("_" #name); \
     if (actual_offset == 0) { \
         FIND(name); \
     } else { \
         addr_t patchfinder_offset = find_ ##name (); \
-        printf("%s: PF=0x%llx - AS=0x%llx - %s\n", #name, patchfinder_offset, actual_offset, ((actual_offset==0?patchfinder_offset!=0:patchfinder_offset == actual_offset) ? "PASS" : "FAIL")); \
+        pass = (actual_offset==0?patchfinder_offset!=0:patchfinder_offset == actual_offset); \
+            printf("%s: PF=0x%llx - AS=0x%llx - %s\n", #name, patchfinder_offset, actual_offset, (pass ? "PASS" : "FAIL")); \
     } \
 } while(false)
     
-    CHECK(syscall_check_sandbox);
-    CHECK(IOMalloc);
-    CHECK(IOFree);
-    CHECK(copy_path_for_vp);
-    CHECK(vn_getpath);
-    CHECK(kmod_start);
-    CHECK(handler_map);
-    CHECK(issue_extension_for_mach_service);
-    CHECK(issue_extension_for_absolute_path);
-    CHECK(policy_conf);
-    CHECK(policy_ops);
-    CHECK(syscall_set_profile);
-    CHECK(sandbox_set_container_copyin);
-    CHECK(platform_set_container);
-    CHECK(extension_create_file);
-    CHECK(extension_add);
-    CHECK(extension_release);
-    CHECK(unix_syscall_return);
-    CHECK(sfree);
-    CHECK(sstrdup);
-    CHECK(pthread_kext_register);
-    CHECK(pthread_callbacks);
-    CHECK(sysent);
-    CHECK(proc_find);
-    CHECK(proc_rele);
-    CHECK(vfs_context_current);
-    CHECK(vnode_lookup);
-    CHECK(vnode_put);
-    CHECK(vnode_getfromfd);
-    CHECK(vnode_getattr);
-    CHECK(SHA1Init);
-    CHECK(SHA1Update);
-    CHECK(SHA1Final);
-    CHECK(csblob_entitlements_dictionary_set);
-    CHECK(kernel_task);
-    CHECK(kernproc);
-    CHECK(vnode_recycle);
-    CHECK(lck_mtx_lock);
-    CHECK(lck_mtx_unlock);
-    CHECK(strlen);
-    CHECK(add_x0_x0_0x40_ret);
-    CHECK(trustcache);
-    CHECK(move_snapshot_to_purgatory);
-    CHECK(apfs_jhash_getvnode);
-    CHECK(zone_map_ref);
-    CHECK(OSBoolean_True);
-    CHECK(osunserializexml);
-    CHECK(smalloc);
-    CHECK(shenanigans);
-    CHECK(fs_lookup_snapshot_metadata_by_name_and_return_name);
-    CHECK(mount_common);
-    CHECK(fs_snapshot);
-    CHECK(vnode_get_snapshot);
-    if (auth_ptrs) {
-        CHECK(paciza_pointer__l2tp_domain_module_start);
-        CHECK(paciza_pointer__l2tp_domain_module_stop);
-        CHECK(l2tp_domain_inited);
-        CHECK(sysctl__net_ppp_l2tp);
-        CHECK(sysctl_unregister_oid);
-        CHECK(mov_x0_x4__br_x5);
-        CHECK(mov_x9_x0__br_x1);
-        CHECK(mov_x10_x3__br_x6);
-        CHECK(kernel_forge_pacia_gadget);
-        CHECK(kernel_forge_pacda_gadget);
-        CHECK(pmap_load_trust_cache);
+    /*
+     don't think this does anything useful? but just in case
+     
+    CHECK(PE_i_can_has_debugger);
+    if (pass && save_fd > 0) {
+        int ret = patch_PE_i_can_has_debugger();
+        if (ret) {
+            printf("Failed to patch PE_i_can_has_debugger\n");
+        }
     }
-    CHECK(IOUserClient__vtable);
-    CHECK(IORegistryEntry__getRegistryEntryID);
-    CHECK(cs_blob_generation_count);
-    CHECK(cs_find_md);
-    CHECK(cs_validate_csblob);
-    CHECK(kalloc_canblock);
-    CHECK(ubc_cs_blob_allocate_site);
-    CHECK(kfree);
-    CHECK(hook_cred_label_update_execve);
-    CHECK(flow_divert_connect_out);
+    else if (!pass) {
+        printf("Failed to find PE_i_can_has_debugger\n");
+        if (save_fd > 0) unlink(argv[3]);
+        exit(EXIT_FAILURE);
+    }*/
+      
+    CHECK(amfi_patch);
+    if (pass && save_fd > 0) {
+        int ret = patch_amfi();
+        if (ret) {
+            printf("Failed to patch amfi\n");
+        }
+    }
+    else if (!pass) {
+        printf("Failed to find amfi_patch\n");
+        if (save_fd > 0) unlink(argv[3]);
+        exit(EXIT_FAILURE);
+    }
+    
+    CHECK(csblob_get_hashtype);
+    if (pass && save_fd > 0) {
+        int ret = patch_csblob_get_hashtype();
+        if (ret) {
+            printf("Failed to patch csblob_get_hashtype\n");
+        }
+    }
+    else if (!pass) {
+        printf("Failed to find csblob_get_hashtype\n");
+        if (save_fd > 0) unlink(argv[3]);
+        exit(EXIT_FAILURE);
+    }
+    
+    CHECK(invalid_pages_patch);
+    if (pass) {
+        CHECK(invalid_pages_patch_2);
+        if (pass && save_fd > 0) {
+            int ret = patch_invalid_pages();
+            if (ret) {
+                printf("Failed to patch invalid_pages\n");
+            }
+        }
+        else if (!pass) {
+            printf("Failed to find invalid_pages_patch_2\n");
+            if (save_fd > 0) unlink(argv[3]);
+            exit(EXIT_FAILURE);
+        }
+    }
+    else {
+        printf("Failed to find invalid_pages_patch\n");
+        if (save_fd > 0) unlink(argv[3]);
+        exit(EXIT_FAILURE);
+    }
+      
+      /*
+       broken i think
+      CHECK(task_for_pid);
+      if (pass && save_fd > 0) {
+          int ret = patch_task_for_pid();
+          if (ret) {
+              printf("Failed to patch task_for_pid\n");
+          }
+      }
+      else if (!pass) {
+          printf("Failed to find task_for_pid\n");
+          if (save_fd > 0) unlink(argv[3]);
+          exit(EXIT_FAILURE);
+      }*/
     
     term_kernel();
     return EXIT_SUCCESS;

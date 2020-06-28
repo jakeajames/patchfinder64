@@ -90,7 +90,7 @@ static addr_t _remove_pac(addr_t addr);
 #define INSN_CBZ  0x34000000, 0x7F000000
 #define INSN_ADRP 0x90000000, 0x9F000000
 
-_pf64 unsigned char *
+_pf64_internal unsigned char *
 boyermoore_horspool_memmem(const unsigned char* haystack, size_t hlen,
                            const unsigned char* needle,   size_t nlen)
 {
@@ -147,131 +147,131 @@ boyermoore_horspool_memmem(const unsigned char* haystack, size_t hlen,
 
 /* disassembler **************************************************************/
 
-_pf64 int HighestSetBit(int N, uint32_t imm)
+_pf64_internal int HighestSetBit(int N, uint32_t imm)
 {
-    int i;
-    for (i = N - 1; i >= 0; i--) {
-        if (imm & (1 << i)) {
-            return i;
-        }
-    }
-    return -1;
+	int i;
+	for (i = N - 1; i >= 0; i--) {
+		if (imm & (1 << i)) {
+			return i;
+		}
+	}
+	return -1;
 }
 
-_pf64 uint64_t ZeroExtendOnes(unsigned M, unsigned N)    // zero extend M ones to N width
+_pf64_internal uint64_t ZeroExtendOnes(unsigned M, unsigned N)	// zero extend M ones to N width
 {
-    (void)N;
-    return ((uint64_t)1 << M) - 1;
+	(void)N;
+	return ((uint64_t)1 << M) - 1;
 }
 
-_pf64 uint64_t RORZeroExtendOnes(unsigned M, unsigned N, unsigned R)
+_pf64_internal uint64_t RORZeroExtendOnes(unsigned M, unsigned N, unsigned R)
 {
-    uint64_t val = ZeroExtendOnes(M, N);
-    if (R == 0) {
-        return val;
-    }
-    return ((val >> R) & (((uint64_t)1 << (N - R)) - 1)) | ((val & (((uint64_t)1 << R) - 1)) << (N - R));
+	uint64_t val = ZeroExtendOnes(M, N);
+	if (R == 0) {
+		return val;
+	}
+	return ((val >> R) & (((uint64_t)1 << (N - R)) - 1)) | ((val & (((uint64_t)1 << R) - 1)) << (N - R));
 }
 
-_pf64 uint64_t Replicate(uint64_t val, unsigned bits)
+_pf64_internal uint64_t Replicate(uint64_t val, unsigned bits)
 {
-    uint64_t ret = val;
-    unsigned shift;
-    for (shift = bits; shift < 64; shift += bits) {    // XXX actually, it is either 32 or 64
-        ret |= (val << shift);
-    }
-    return ret;
+	uint64_t ret = val;
+	unsigned shift;
+	for (shift = bits; shift < 64; shift += bits) {	// XXX actually, it is either 32 or 64
+		ret |= (val << shift);
+	}
+	return ret;
 }
 
-_pf64 int DecodeBitMasks(unsigned immN, unsigned imms, unsigned immr, int immediate, uint64_t *newval)
+_pf64_internal int DecodeBitMasks(unsigned immN, unsigned imms, unsigned immr, int immediate, uint64_t *newval)
 {
-    unsigned levels, S, R, esize;
-    int len = HighestSetBit(7, (immN << 6) | (~imms & 0x3F));
-    if (len < 1) {
-        return -1;
-    }
-    levels = (unsigned int)ZeroExtendOnes(len, 6);
-    if (immediate && (imms & levels) == levels) {
-        return -1;
-    }
-    S = imms & levels;
-    R = immr & levels;
-    esize = 1 << len;
-    *newval = Replicate(RORZeroExtendOnes(S + 1, esize, R), esize);
-    return 0;
+	unsigned levels, S, R, esize;
+	int len = HighestSetBit(7, (immN << 6) | (~imms & 0x3F));
+	if (len < 1) {
+		return -1;
+	}
+	levels = (unsigned int)ZeroExtendOnes(len, 6);
+	if (immediate && (imms & levels) == levels) {
+		return -1;
+	}
+	S = imms & levels;
+	R = immr & levels;
+	esize = 1 << len;
+	*newval = Replicate(RORZeroExtendOnes(S + 1, esize, R), esize);
+	return 0;
 }
 
-_pf64 int DecodeMov(uint32_t opcode, uint64_t total, int first, uint64_t *newval)
+_pf64_internal int DecodeMov(uint32_t opcode, uint64_t total, int first, uint64_t *newval)
 {
-    unsigned o = (opcode >> 29) & 3;
-    unsigned k = (opcode >> 23) & 0x3F;
-    unsigned rn, rd;
-    uint64_t i;
+	unsigned o = (opcode >> 29) & 3;
+	unsigned k = (opcode >> 23) & 0x3F;
+	unsigned rn, rd;
+	uint64_t i;
 
-    if (k == 0x24 && o == 1) {            // MOV (bitmask imm) <=> ORR (immediate)
-        unsigned s = (opcode >> 31) & 1;
-        unsigned N = (opcode >> 22) & 1;
-        if (s == 0 && N != 0) {
-            return -1;
-        }
-        rn = (opcode >> 5) & 0x1F;
-        if (rn == 31) {
-            unsigned imms = (opcode >> 10) & 0x3F;
-            unsigned immr = (opcode >> 16) & 0x3F;
-            return DecodeBitMasks(N, imms, immr, 1, newval);
-        }
-    } else if (k == 0x25) {                // MOVN/MOVZ/MOVK
-        unsigned s = (opcode >> 31) & 1;
-        unsigned h = (opcode >> 21) & 3;
-        if (s == 0 && h > 1) {
-            return -1;
-        }
-        i = (opcode >> 5) & 0xFFFF;
-        h *= 16;
-        i <<= h;
-        if (o == 0) {                // MOVN
-            *newval = ~i;
-            return 0;
-        } else if (o == 2) {            // MOVZ
-            *newval = i;
-            return 0;
-        } else if (o == 3 && !first) {        // MOVK
-            *newval = (total & ~((uint64_t)0xFFFF << h)) | i;
-            return 0;
-        }
-    } else if ((k | 1) == 0x23 && !first) {        // ADD (immediate)
-        unsigned h = (opcode >> 22) & 3;
-        if (h > 1) {
-            return -1;
-        }
-        rd = opcode & 0x1F;
-        rn = (opcode >> 5) & 0x1F;
-        if (rd != rn) {
-            return -1;
-        }
-        i = (opcode >> 10) & 0xFFF;
-        h *= 12;
-        i <<= h;
-        if (o & 2) {                // SUB
-            *newval = total - i;
-            return 0;
-        } else {                // ADD
-            *newval = total + i;
-            return 0;
-        }
-    }
+	if (k == 0x24 && o == 1) {			// MOV (bitmask imm) <=> ORR (immediate)
+		unsigned s = (opcode >> 31) & 1;
+		unsigned N = (opcode >> 22) & 1;
+		if (s == 0 && N != 0) {
+			return -1;
+		}
+		rn = (opcode >> 5) & 0x1F;
+		if (rn == 31) {
+			unsigned imms = (opcode >> 10) & 0x3F;
+			unsigned immr = (opcode >> 16) & 0x3F;
+			return DecodeBitMasks(N, imms, immr, 1, newval);
+		}
+	} else if (k == 0x25) {				// MOVN/MOVZ/MOVK
+		unsigned s = (opcode >> 31) & 1;
+		unsigned h = (opcode >> 21) & 3;
+		if (s == 0 && h > 1) {
+			return -1;
+		}
+		i = (opcode >> 5) & 0xFFFF;
+		h *= 16;
+		i <<= h;
+		if (o == 0) {				// MOVN
+			*newval = ~i;
+			return 0;
+		} else if (o == 2) {			// MOVZ
+			*newval = i;
+			return 0;
+		} else if (o == 3 && !first) {		// MOVK
+			*newval = (total & ~((uint64_t)0xFFFF << h)) | i;
+			return 0;
+		}
+	} else if ((k | 1) == 0x23 && !first) {		// ADD (immediate)
+		unsigned h = (opcode >> 22) & 3;
+		if (h > 1) {
+			return -1;
+		}
+		rd = opcode & 0x1F;
+		rn = (opcode >> 5) & 0x1F;
+		if (rd != rn) {
+			return -1;
+		}
+		i = (opcode >> 10) & 0xFFF;
+		h *= 12;
+		i <<= h;
+		if (o & 2) {				// SUB
+			*newval = total - i;
+			return 0;
+		} else {				// ADD
+			*newval = total + i;
+			return 0;
+		}
+	}
 
-    return -1;
+	return -1;
 }
 
-_pf64 uint64_t ROR64(uint64_t x, int shift)
+_pf64_internal uint64_t ROR64(uint64_t x, int shift)
 {
     if (shift == 0) return x;
     int m = shift % 64;
     return (x >> m) | x<<(64-m);
 }
 
-_pf64 uint32_t ROR32(uint64_t x, int shift)
+_pf64_internal uint32_t ROR32(uint64_t x, int shift)
 {
     if (shift == 0) return x;
     int m = shift % 32;
@@ -280,7 +280,7 @@ _pf64 uint32_t ROR32(uint64_t x, int shift)
 
 /* patchfinder ***************************************************************/
 
-_pf64 addr_t
+_pf64_internal addr_t
 step64(const uint8_t *buf, addr_t start, size_t length, uint32_t what, uint32_t mask)
 {
     addr_t end = start + length;
@@ -294,7 +294,7 @@ step64(const uint8_t *buf, addr_t start, size_t length, uint32_t what, uint32_t 
     return 0;
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 step64_back(const uint8_t *buf, addr_t start, size_t length, uint32_t what, uint32_t mask)
 {
     addr_t end = start - length;
@@ -308,7 +308,7 @@ step64_back(const uint8_t *buf, addr_t start, size_t length, uint32_t what, uint
     return 0;
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 bof64(const uint8_t *buf, addr_t start, addr_t where)
 {
     if (auth_ptrs) {
@@ -368,7 +368,7 @@ bof64(const uint8_t *buf, addr_t start, addr_t where)
     return 0;
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
 {
     addr_t i;
@@ -391,7 +391,7 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
                     signed adr = ((op & 0x60000000) >> 18) | ((op & 0xFFFFE0) << 8);
                     //printf("%llx: ADRP X%d, 0x%llx\n", i, reg, ((long long)adr << 1) + (i & ~0xFFF));
                     value[reg] = ((long long)adr << 1) + (i & ~0xFFF);
-                    continue;                // XXX should not XREF on its own?
+                    continue;				// XXX should not XREF on its own?
                 }
             case 0xb9:
             case 0xf9:
@@ -418,9 +418,9 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
                         //printf("%llx: LDR X%d, [X%d, 0x%x]\n", i, reg, rn, imm);
                         if (!imm) {
                             value[reg] = 0;
-                            continue;            // XXX not counted as true xref
+                            continue;			// XXX not counted as true xref
                         }
-                        value[reg] = value[rn] + imm;    // XXX address, not actual value
+                        value[reg] = value[rn] + imm;	// XXX address, not actual value
                     }
                     break;
                 }
@@ -463,8 +463,8 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
             unsigned rn = (op >> 5) & 0x1F;
             unsigned imm = ((op >> 10) & 0xFFF) << 3;
             //printf("%llx: STR X%d, [X%d, 0x%x]\n", i, reg, rn, imm);
-            if (!imm) continue;            // XXX not counted as true xref
-            value[rn] = value[rn] + imm;    // XXX address, not actual value*/
+            if (!imm) continue;			// XXX not counted as true xref
+            value[rn] = value[rn] + imm;	// XXX address, not actual value*/
             case 0x10:
             case 0x30:
             case 0x50:
@@ -481,7 +481,7 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
                     //if ((op & 0xFF000000) == 0x58000000) {
                     unsigned adr = (op & 0xFFFFE0) >> 3;
                     //printf("%llx: LDR X%d, =0x%llx\n", i, reg, adr + i);
-                    value[reg] = adr + i;        // XXX address, not actual value
+                    value[reg] = adr + i;		// XXX address, not actual value
                     break;
                 }
             case 0x14:
@@ -538,7 +538,7 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
     return 0;
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 calc64(const uint8_t *buf, addr_t start, addr_t end, int which)
 {
     addr_t i;
@@ -603,12 +603,12 @@ calc64(const uint8_t *buf, addr_t start, addr_t end, int which)
             unsigned rn = (op >> 5) & 0x1F;
             unsigned imm = ((op >> 10) & 0xFFF) << 3;
             //printf("%llx: LDR X%d, [X%d, 0x%x]\n", i, reg, rn, imm);
-            value[reg] = value[rn] + imm;    // XXX address, not actual value
+            value[reg] = value[rn] + imm;	// XXX address, not actual value
         } else if ((op & 0xF9C00000) == 0xF9000000) {
             unsigned rn = (op >> 5) & 0x1F;
             unsigned imm = ((op >> 10) & 0xFFF) << 3;
             //printf("%llx: STR X%d, [X%d, 0x%x]\n", i, reg, rn, imm);
-            value[rn] = value[rn] + imm;    // XXX address, not actual value
+            value[rn] = value[rn] + imm;	// XXX address, not actual value
         } else if ((op & 0x9F000000) == 0x10000000) {
             signed adr = ((op & 0x60000000) >> 18) | ((op & 0xFFFFE0) << 8);
             //printf("%llx: ADR X%d, 0x%llx\n", i, reg, ((long long)adr >> 11) + i);
@@ -616,7 +616,7 @@ calc64(const uint8_t *buf, addr_t start, addr_t end, int which)
         } else if ((op & 0xFF000000) == 0x58000000) {
             unsigned adr = (op & 0xFFFFE0) >> 3;
             //printf("%llx: LDR X%d, =0x%llx\n", i, reg, adr + i);
-            value[reg] = adr + i;        // XXX address, not actual value
+            value[reg] = adr + i;		// XXX address, not actual value
         } else if ((op & 0xF9C00000) == 0xb9400000) { // 32bit
             unsigned rn = (op >> 5) & 0x1F;
             unsigned imm = ((op >> 10) & 0xFFF) << 2;
@@ -649,7 +649,7 @@ calc64(const uint8_t *buf, addr_t start, addr_t end, int which)
     return value[which];
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 calc64mov(const uint8_t *buf, addr_t start, addr_t end, int which)
 {
     addr_t i;
@@ -673,13 +673,13 @@ calc64mov(const uint8_t *buf, addr_t start, addr_t end, int which)
     return value[which];
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 find_call64(const uint8_t *buf, addr_t start, size_t length)
 {
     return step64(buf, start, length, INSN_CALL);
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 follow_call64(const uint8_t *buf, addr_t call)
 {
     long long w;
@@ -689,7 +689,7 @@ follow_call64(const uint8_t *buf, addr_t call)
     return call + w;
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 follow_stub(const uint8_t *buf, addr_t call)
 {
     addr_t stub = follow_call64(buf, call);
@@ -704,7 +704,7 @@ follow_stub(const uint8_t *buf, addr_t call)
     return *(addr_t*)(buf + target_function_offset);
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 find_parent_of_stub(const uint8_t *buf, addr_t stub, enum text_bases text_base)
 {
     addr_t call;
@@ -724,13 +724,13 @@ find_parent_of_stub(const uint8_t *buf, addr_t stub, enum text_bases text_base)
     return func + kerndumpbase;
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 follow_cbz(const uint8_t *buf, addr_t cbz)
 {
     return cbz + ((*(int *)(buf + cbz) & 0x3FFFFE0) << 10 >> 13);
 }
 
-_pf64 addr_t
+_pf64_internal addr_t
 _remove_pac(addr_t addr)
 {
     if (!addr || addr >= kerndumpbase) return addr;
@@ -742,7 +742,7 @@ _remove_pac(addr_t addr)
     return addr;
 }
 
-_pf64 void rebase_sysctl_oid(uint8_t *buf, struct sysctl_oid *sysctl) {
+_pf64_internal void rebase_sysctl_oid(uint8_t *buf, struct sysctl_oid *sysctl) {
     sysctl->oid_parent = (struct sysctl_oid_list*)KADDR_TO_BUF(buf, remove_pac(sysctl->oid_parent));
     if (SLIST_NEXT(sysctl, oid_link)) SLIST_NEXT(sysctl, oid_link) = (struct sysctl_oid *)KADDR_TO_BUF(buf, remove_pac(SLIST_NEXT(sysctl, oid_link)));
     sysctl->oid_arg1 = (void *)KADDR_TO_BUF(buf, remove_pac(sysctl->oid_arg1));
@@ -752,7 +752,7 @@ _pf64 void rebase_sysctl_oid(uint8_t *buf, struct sysctl_oid *sysctl) {
     sysctl->oid_descr = (const char *)KADDR_TO_BUF(buf, remove_pac(sysctl->oid_descr));
 }
 
-_pf64 bool register_sysctl_oid(uint8_t *buf, struct sysctl_oid *sysctl) {
+_pf64_internal bool register_sysctl_oid(uint8_t *buf, struct sysctl_oid *sysctl) {
     rebase_sysctl_oid(buf, sysctl);
     if (sysctl->oid_version != SYSCTL_OID_VERSION) {
         fprintf(stderr, "encountered unknown sysctl version %d\n", sysctl->oid_number);
@@ -794,7 +794,7 @@ _pf64 bool register_sysctl_oid(uint8_t *buf, struct sysctl_oid *sysctl) {
 }
 
 // TODO: follow default case
-_pf64 addr_t follow_switch(const uint8_t *buf, addr_t entry, int branch) {
+_pf64_internal addr_t follow_switch(const uint8_t *buf, addr_t entry, int branch) {
     uint64_t ref = (uint64_t)step64(buf, entry, 0x100, 0x7100001F, 0xFFC0001F);
     if (!ref) return 0;
     uint32_t insn = *(uint32_t*)(buf+ref);
@@ -988,12 +988,12 @@ init_kernel(kread_t kread, addr_t kernel_base, const char *filename)
             uint32_t *ptr = (uint32_t *)(cmd + 1);
             uint32_t flavor = ptr[0];
             struct {
-                uint64_t x[29];    /* General purpose registers x0-x28 */
-                uint64_t fp;    /* Frame pointer x29 */
-                uint64_t lr;    /* Link register x30 */
-                uint64_t sp;    /* Stack pointer x31 */
-                uint64_t pc;     /* Program counter */
-                uint32_t cpsr;    /* Current program status register */
+                uint64_t x[29];	/* General purpose registers x0-x28 */
+                uint64_t fp;	/* Frame pointer x29 */
+                uint64_t lr;	/* Link register x30 */
+                uint64_t sp;	/* Stack pointer x31 */
+                uint64_t pc; 	/* Program counter */
+                uint32_t cpsr;	/* Current program status register */
             } *thread = (void *)(ptr + 2);
             if (flavor == 6) {
                 kernel_entry = thread->pc;
@@ -1022,12 +1022,12 @@ init_kernel(kread_t kread, addr_t kernel_base, const char *filename)
     sysctl_set_base -= kerndumpbase;
     const_base -= kerndumpbase;
     kernel_size = max - min;
-    
+	
 #define READ_BASE(base, size) do { \
-    rv = kread(kerndumpbase + base, (void *)((uintptr_t)kernel + base), size); \
-    if (rv == -1) { \
-        return -1; \
-    } \
+	rv = kread(kerndumpbase + base, (void *)((uintptr_t)kernel + base), size); \
+	if (rv == -1) { \
+		return -1; \
+	} \
 } while (false)
 
     if (filename == NULL) {
@@ -1035,15 +1035,15 @@ init_kernel(kread_t kread, addr_t kernel_base, const char *filename)
         if (!kernel) {
             return -1;
         }
-        READ_BASE(xnucore_base, xnucore_size);
-        READ_BASE(prelink_base, prelink_size);
-        READ_BASE(cstring_base, cstring_size);
-        READ_BASE(pstring_base, pstring_size);
-        READ_BASE(oslstring_base, oslstring_size);
-        READ_BASE(data_const_base, data_const_size);
-        READ_BASE(data_base, data_size);
-        READ_BASE(sysctl_set_base, sysctl_set_size);
-        READ_BASE(const_base, const_size);
+		READ_BASE(xnucore_base, xnucore_size);
+		READ_BASE(prelink_base, prelink_size);
+		READ_BASE(cstring_base, cstring_size);
+		READ_BASE(pstring_base, pstring_size);
+		READ_BASE(oslstring_base, oslstring_size);
+		READ_BASE(data_const_base, data_const_size);
+		READ_BASE(data_base, data_size);
+		READ_BASE(sysctl_set_base, sysctl_set_size);
+		READ_BASE(const_base, const_size);
 
         kernel_mh = kernel + kernel_base - min;
     } else {
@@ -1826,7 +1826,7 @@ find_realhost_for(addr_t priv)
  *
  * @ninjaprawn's patches
  *
- */
+ */ 
 
 _pf64_external addr_t find_vfs_context_current(void) {
     addr_t str = find_strref("/private/var/tmp/wav%u_%uchans.wav", 1, string_base_pstring, false, false);
@@ -2216,7 +2216,7 @@ _pf64_external addr_t find_add_x0_x0_0x40_ret(void)
 
 /*
  *
- *
+ * 
  *
  */
 
@@ -2224,7 +2224,7 @@ _pf64_external addr_t find_add_x0_x0_0x40_ret(void)
  *
  * @Cryptiiiic's patches
  *
- */
+ */ 
 
 _pf64_external addr_t find_boottime(void) {
     addr_t ref = find_strref("%s WARNING: PMU offset is less then sys PMU", 1, string_base_oslstring, false, false);
@@ -2273,7 +2273,7 @@ _pf64_external addr_t find_boottime(void) {
 
 /*
  *
- *
+ * 
  *
  */
 
@@ -3554,7 +3554,7 @@ _pf64_external addr_t find_check_for_signature() {
     return func + kerndumpbase;
 }
 
-_pf64 struct sysctl_oid *find_sysctl_by_name(char *name, struct sysctl_oid_list* parent) {
+_pf64_internal struct sysctl_oid *find_sysctl_by_name(char *name, struct sysctl_oid_list* parent) {
     char localname[strlen(name)+1];
     strcpy(localname, name);
     if (!parent) parent = sysctl__children;
@@ -4055,7 +4055,7 @@ struct apfs_sysctl_list_entry {
 
 SLIST_HEAD(apfs_sysctl_list, apfs_sysctl_list_entry);
 
-_pf64 bool apfs_sysctl_register(void) {
+_pf64_internal bool apfs_sysctl_register(void) {
     addr_t sysctl_register_oid_call, adrp;
     addr_t apfs_sysctl_register_addr = find_apfs_sysctl_register();
     if (!apfs_sysctl_register_addr) { // inlined? :(
@@ -5059,7 +5059,7 @@ _pf64_external size_t offsetof_proc_p_csflags(void) {
     return offset;
 }
 
-_pf64 size_t offsetin_PROC_UPDATE_CREDS_ONPROC_macro(int n) {
+_pf64_internal size_t offsetin_PROC_UPDATE_CREDS_ONPROC_macro(int n) {
     addr_t setgid = find_syscall(SYS_setgid);
     if (!setgid) return -1;
     setgid -= kerndumpbase;
@@ -5231,7 +5231,7 @@ _pf64_external size_t offsetof_ipc_port_ip_receiver(void) {
     return offset;
     //A905D51F
     //  STP XZR, Xn, [Xy,#offset]
-    //addr_t stp_xzr_xn_xy = step64(kernel, mov_xn_x0, 0x50,
+    //addr_t stp_xzr_xn_xy = step64(kernel, mov_xn_x0, 0x50, 
 
 }
 
@@ -5276,7 +5276,7 @@ _pf64_external size_t sizeof_the_real_platform_profile_data(void) {
     return size;
 }
 
-_pf64 size_t size_sbops(void) {
+_pf64_internal size_t size_sbops(void) {
     addr_t platform_profile = find_platform_profile();
     if (!platform_profile) return -1;
     platform_profile += sizeof(addr_t);
@@ -5338,7 +5338,7 @@ _pf64_external size_t offsetof_sbop(const char *sbop) {
     return index;
 }
 
-_pf64 bool populate_proc_offsets(void) {
+_pf64_internal bool populate_proc_offsets(void) {
     addr_t proc_pidshortbsdinfo = find_proc_pidshortbsdinfo();
     if (!proc_pidshortbsdinfo) return 0;
     proc_pidshortbsdinfo -= kerndumpbase;
@@ -5725,4 +5725,4 @@ main(int argc, char **argv)
     return EXIT_SUCCESS;
 }
 
-#endif    /* HAVE_MAIN */
+#endif	/* HAVE_MAIN */

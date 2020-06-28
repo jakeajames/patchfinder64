@@ -2,6 +2,7 @@
 import os, subprocess
 
 for subdir, dirs, files in os.walk("kernel_caches"):
+    dirs.sort();
     for version in dirs:
         print("Testing version: {}".format(version));
         d = os.path.join("kernel_caches", version)
